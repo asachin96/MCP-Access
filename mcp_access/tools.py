@@ -110,7 +110,10 @@ TOOLS = [
     ),
     types.Tool(
         name="access_close",
-        description="Closes the COM session and releases the .accdb/.mdb file.",
+        description=(
+            "Releases the COM session. Quits Access only when MCP created the instance; "
+            "an attached user-owned Access instance remains open."
+        ),
         inputSchema={
             "type": "object",
             "properties": {},
