@@ -111,8 +111,8 @@ TOOLS = [
     types.Tool(
         name="access_close",
         description=(
-            "Releases the COM session. Quits Access only when MCP created the instance; "
-            "an attached user-owned Access instance remains open."
+            "Releases the COM session. Quits and verifies bounded process exit only when "
+            "MCP created Access; an attached user-owned instance and database remain open."
         ),
         inputSchema={
             "type": "object",

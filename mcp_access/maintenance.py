@@ -187,6 +187,7 @@ def ac_decompile_compact(db_path: str) -> dict:
         _Session._app = None
         _Session._db_open = None
         _Session._owns_app = False
+        _Session._app_pid = None
     except RuntimeError:
         raise
     except Exception:

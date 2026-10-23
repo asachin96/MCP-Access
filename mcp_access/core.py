@@ -64,6 +64,7 @@ AC_TYPE: dict[str, int] = {
 # ---------------------------------------------------------------------------
 _vbe_code_cache: dict = {}        # "type:name" -> full text of VBE module
 _parsed_controls_cache: dict = {} # "form:name" / "report:name" -> _parse_controls() result
+_OWNED_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 # ---------------------------------------------------------------------------
 # COM Session -- singleton, keeps Access alive between calls
@@ -72,11 +73,14 @@ class _Session:
     """
     Maintains a single Access.Application instance across tool calls.
     An attached user instance is never closed or switched to another database.
+    If that instance has no database open, MCP may open the requested database
+    in it and leaves that database open when the session disconnects.
     An instance created by MCP can be switched and closed.
     """
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
     _owns_app: bool = False
+    _app_pid: Optional[int] = None
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
 
@@ -105,6 +109,7 @@ class _Session:
         cls._app = None
         cls._db_open = None
         cls._owns_app = False
+        cls._app_pid = None
         cls._decompiled_dbs.clear()
 
     @classmethod
@@ -155,8 +160,10 @@ class _Session:
             cls._app = None
             cls._db_open = None
             cls._owns_app = False
+            cls._app_pid = None
             return False
         cls._owns_app = False
+        cls._app_pid = cls._get_access_process_id(cls._app)
         log.info("Attached to existing Access.Application instance")
         cls._db_open = cls._current_database_path()
         if cls._db_open:
@@ -176,8 +183,9 @@ class _Session:
             cls._app = win32com.client.DispatchEx("Access.Application")
             cls._owns_app = True
             cls._app.Visible = True   # required for VBE to be accessible via COM
+            cls._app_pid = cls._get_access_process_id(cls._app)
             cls._db_open = cls._current_database_path()
-            log.info("Access launched OK")
+            log.info("Access launched OK (PID=%s)", cls._app_pid or "unknown")
         except Exception as exc:
             app = cls._app
             if app is not None and cls._owns_app:
@@ -230,6 +238,7 @@ class _Session:
             cls._app = None
             cls._db_open = None
             cls._owns_app = False
+            cls._app_pid = None
 
         log.info("Decompiling %s ...", path)
 
@@ -443,6 +452,74 @@ class _Session:
         cls._clear_object_caches()
         log.info("DB opened OK")
 
+    @staticmethod
+    def _get_access_process_id(app: Any) -> Optional[int]:
+        try:
+            import win32process
+
+            hwnd_value = app.hWndAccessApp
+            hwnd = int(hwnd_value() if callable(hwnd_value) else hwnd_value)
+            if not hwnd:
+                return None
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return int(pid) if pid else None
+        except Exception as exc:
+            log.warning("Could not determine Access process ID: %s", exc)
+            return None
+
+    @staticmethod
+    def _wait_for_process_exit(pid: int, timeout_seconds: float) -> Optional[bool]:
+        """Wait for a process while continuing to pump the COM STA message queue."""
+        from ctypes import wintypes
+
+        import pythoncom
+
+        synchronize = 0x00100000
+        wait_object_0 = 0
+        wait_timeout = 258
+        wait_failed = 0xFFFFFFFF
+        error_invalid_parameter = 87
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        process_handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not process_handle:
+            error = ctypes.get_last_error()
+            if error == error_invalid_parameter:
+                return True
+            log.warning("Could not open Access PID %s for shutdown verification (error=%s)", pid, error)
+            return None
+
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wait_ms = min(100, max(1, int(remaining * 1000)))
+                result = kernel32.WaitForSingleObject(process_handle, wait_ms)
+                if result == wait_object_0:
+                    return True
+                if result == wait_failed:
+                    log.warning(
+                        "Could not wait for Access PID %s (error=%s)",
+                        pid,
+                        ctypes.get_last_error(),
+                    )
+                    return None
+                if result != wait_timeout:
+                    log.warning("Unexpected wait result for Access PID %s: %s", pid, result)
+                    return None
+                pythoncom.PumpWaitingMessages()
+        finally:
+            kernel32.CloseHandle(process_handle)
+
     @classmethod
     def quit(cls, suppress_errors: bool = False) -> str:
         if cls._app is None:
@@ -451,24 +528,67 @@ class _Session:
 
         app = cls._app
         owns_app = cls._owns_app
+        pid = (cls._app_pid or cls._get_access_process_id(app)) if owns_app else None
         cls._clear_object_caches()
-        try:
-            if owns_app:
-                log.info("Requesting shutdown of the MCP-owned Access instance...")
-                app.Quit()
-                return "Shutdown requested for the Access instance created by MCP."
+
+        if not owns_app:
             log.info("Releasing attached COM session without closing Access...")
+            cls._app = None
+            cls._db_open = None
+            cls._owns_app = False
+            cls._app_pid = None
+            cls._decompiled_dbs.clear()
+            app = None
             return "COM session released; the attached Access instance remains open."
+
+        quit_error = None
+        try:
+            log.info("Requesting shutdown of the MCP-owned Access instance...")
+            app.Quit()
         except Exception as exc:
-            log.warning("Error closing Access: %s", exc)
-            if not suppress_errors:
-                raise RuntimeError(f"Could not close the MCP-owned Access instance: {exc}") from exc
-            return f"Error closing Access during server shutdown: {exc}"
+            quit_error = exc
         finally:
             cls._app = None
             cls._db_open = None
             cls._owns_app = False
+            cls._app_pid = None
             cls._decompiled_dbs.clear()
+            app = None
+
+        if quit_error is not None:
+            log.warning("Error closing Access: %s", quit_error)
+            message = f"Could not close the MCP-owned Access instance: {quit_error}"
+            if not suppress_errors:
+                raise RuntimeError(message) from quit_error
+            return message
+
+        if pid is None:
+            message = (
+                "Shutdown requested for the Access instance created by MCP; "
+                "process exit could not be verified because its PID was unavailable."
+            )
+            log.warning(message)
+            return message
+
+        exited = cls._wait_for_process_exit(pid, _OWNED_SHUTDOWN_TIMEOUT_SECONDS)
+        if exited is True:
+            return f"The Access instance created by MCP exited successfully (PID {pid})."
+        if exited is None:
+            message = (
+                f"Shutdown requested for the Access instance created by MCP (PID {pid}), "
+                "but process exit could not be verified."
+            )
+            log.warning(message)
+            return message
+
+        message = (
+            f"Shutdown timed out: Access PID {pid} did not exit within "
+            f"{_OWNED_SHUTDOWN_TIMEOUT_SECONDS:g} seconds."
+        )
+        log.warning(message)
+        if not suppress_errors:
+            raise RuntimeError(message)
+        return message
 
 
 def shutdown_com_thread() -> str:

@@ -97,6 +97,8 @@ class SessionLifecycleTests(unittest.TestCase):
             patch.object(win32com.client, "GetActiveObject", side_effect=RuntimeError("not running")),
             patch.object(win32com.client, "DispatchEx", return_value=app),
             patch.object(core.ctypes, "windll", fake_windll),
+            patch.object(core._Session, "_get_access_process_id", return_value=4242),
+            patch.object(core._Session, "_wait_for_process_exit", return_value=True) as wait_for_exit,
         ):
             self.assertIs(core._Session.connect(self.target), app)
             self.assertTrue(core._Session._owns_app)
@@ -105,9 +107,30 @@ class SessionLifecycleTests(unittest.TestCase):
 
             result = core._Session.quit()
 
-        self.assertIn("Shutdown requested", result)
+        self.assertIn("exited successfully", result)
         self.assertEqual(app.close_calls, 0)
         self.assertEqual(app.quit_calls, 1)
+        wait_for_exit.assert_called_once_with(
+            4242,
+            core._OWNED_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+
+    def test_owned_shutdown_timeout_is_reported(self):
+        app = _FakeApp(current=self.target)
+        core._Session._app = app
+        core._Session._db_open = self.target
+        core._Session._owns_app = True
+
+        with (
+            patch.object(core._Session, "_get_access_process_id", return_value=4242),
+            patch.object(core._Session, "_wait_for_process_exit", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not exit within 10 seconds"):
+                core._Session.quit()
+
+        self.assertEqual(app.quit_calls, 1)
+        self.assertIsNone(core._Session._app)
+        self.assertFalse(core._Session._owns_app)
 
     def test_attached_instance_with_different_database_is_rejected(self):
         app = _FakeApp(current=self.other)
@@ -118,6 +141,26 @@ class SessionLifecycleTests(unittest.TestCase):
         self.assertEqual(app.close_calls, 0)
         self.assertEqual(app.open_calls, [])
         self.assertEqual(app.current, self.other)
+
+    def test_attached_instance_without_database_retains_opened_target(self):
+        app = _FakeApp(current=None)
+        fake_windll = SimpleNamespace(
+            user32=SimpleNamespace(keybd_event=lambda *_: None),
+        )
+        with (
+            patch.object(win32com.client, "GetActiveObject", return_value=app),
+            patch.object(core.ctypes, "windll", fake_windll),
+        ):
+            self.assertIs(core._Session.connect(self.target), app)
+            self.assertFalse(core._Session._owns_app)
+            self.assertEqual(app.open_calls, [os.path.abspath(self.target)])
+
+            result = core._Session.quit()
+
+        self.assertIn("remains open", result)
+        self.assertEqual(app.current, os.path.abspath(self.target))
+        self.assertEqual(app.close_calls, 0)
+        self.assertEqual(app.quit_calls, 0)
 
     def test_auto_decompile_does_not_close_uncached_user_instance(self):
         app = _FakeApp(current=self.target)
